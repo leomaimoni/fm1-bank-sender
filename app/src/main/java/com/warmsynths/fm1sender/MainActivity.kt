@@ -1,7 +1,15 @@
 package com.warmsynths.fm1sender
 
+import android.app.PendingIntent
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.hardware.usb.UsbDevice
+import android.hardware.usb.UsbManager
 import android.media.midi.MidiDeviceInfo
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -18,9 +26,14 @@ import androidx.compose.ui.unit.dp
 
 data class BankFile(val uri: Uri, val name: String)
 
+private const val ACTION_USB_PERMISSION = "com.warmsynths.fm1sender.USB_PERMISSION"
+
 class MainActivity : ComponentActivity() {
 
     private lateinit var midiHelper: MidiUsbHelper
+    private lateinit var usbManager: UsbManager
+
+    private var pendingUsbPermissionCallback: ((Boolean) -> Unit)? = null
 
     private var banks by mutableStateOf<List<BankFile>>(emptyList())
     private var usbDevices by mutableStateOf<List<MidiDeviceInfo>>(emptyList())
@@ -28,20 +41,29 @@ class MainActivity : ComponentActivity() {
     private var statusMessage by mutableStateOf("Selecione os bancos e conecte o FM-1 pelo cabo USB.")
     private var isSending by mutableStateOf(false)
 
+    private val usbPermissionReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action != ACTION_USB_PERMISSION) return
+            val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
+            val callback = pendingUsbPermissionCallback
+            pendingUsbPermissionCallback = null
+            callback?.invoke(granted)
+        }
+    }
+
     private val pickFiles = registerForActivityResult(
         ActivityResultContracts.OpenMultipleDocuments()
     ) { uris ->
         if (uris.isNotEmpty()) {
-            val newOnes = uris.mapNotNull { uri ->
+            val newOnes = uris.map { uri ->
                 val name = queryFileName(uri) ?: uri.lastPathSegment ?: "banco.syx"
                 try {
                     contentResolver.takePersistableUriPermission(
-                        uri, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
+                        uri, Intent.FLAG_GRANT_READ_URI_PERMISSION
                     )
                 } catch (_: Exception) { /* alguns provedores não suportam, tudo bem */ }
                 BankFile(uri, name)
             }
-            // evita duplicados
             val existingUris = banks.map { it.uri }.toSet()
             banks = banks + newOnes.filter { it.uri !in existingUris }
         }
@@ -50,6 +72,16 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         midiHelper = MidiUsbHelper(this)
+        usbManager = getSystemService(Context.USB_SERVICE) as UsbManager
+
+        val filter = IntentFilter(ACTION_USB_PERMISSION)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(usbPermissionReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            registerReceiver(usbPermissionReceiver, filter)
+        }
+
         refreshUsbDevices()
 
         setContent {
@@ -68,6 +100,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         midiHelper.close()
+        try {
+            unregisterReceiver(usbPermissionReceiver)
+        } catch (_: Exception) { }
         super.onDestroy()
     }
 
@@ -86,10 +121,68 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * Tenta achar o UsbDevice físico por trás de um MidiDeviceInfo, para podermos
+     * checar/pedir a permissão de acesso USB antes de abrir a porta MIDI.
+     */
+    private fun findUsbDeviceFor(deviceInfo: MidiDeviceInfo): UsbDevice? {
+        // Caminho direto, disponível a partir do Android 11 (API 30).
+        val direct: UsbDevice? = when {
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU ->
+                deviceInfo.properties.getParcelable(
+                    MidiDeviceInfo.PROPERTY_USB_DEVICE, UsbDevice::class.java
+                )
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.R ->
+                @Suppress("DEPRECATION")
+                deviceInfo.properties.getParcelable(MidiDeviceInfo.PROPERTY_USB_DEVICE)
+            else -> null
+        }
+        if (direct != null) return direct
+
+        // Alternativa: casar pelo nome/produto, ou usar o único dispositivo USB conectado.
+        val candidates = usbManager.deviceList.values.toList()
+        if (candidates.size == 1) return candidates.first()
+
+        val product = deviceInfo.properties.getString(MidiDeviceInfo.PROPERTY_PRODUCT)
+        val name = deviceInfo.properties.getString(MidiDeviceInfo.PROPERTY_NAME)
+        return candidates.firstOrNull { it.productName == product || it.productName == name }
+    }
+
+    private fun requestUsbPermission(usbDevice: UsbDevice, callback: (Boolean) -> Unit) {
+        pendingUsbPermissionCallback = callback
+        val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            PendingIntent.FLAG_MUTABLE
+        } else {
+            0
+        }
+        val permissionIntent = PendingIntent.getBroadcast(
+            this, 0, Intent(ACTION_USB_PERMISSION), flags
+        )
+        usbManager.requestPermission(usbDevice, permissionIntent)
+    }
+
     private fun connectTo(device: MidiDeviceInfo) {
         val label = device.properties.getString(MidiDeviceInfo.PROPERTY_NAME)
             ?: device.properties.getString(MidiDeviceInfo.PROPERTY_PRODUCT)
             ?: "Dispositivo USB"
+
+        val usbDevice = findUsbDeviceFor(device)
+
+        if (usbDevice != null && !usbManager.hasPermission(usbDevice)) {
+            statusMessage = "Pedindo permissão de acesso ao USB... aceite o diálogo que vai aparecer."
+            requestUsbPermission(usbDevice) { granted ->
+                if (granted) {
+                    openMidiDevice(device, label)
+                } else {
+                    statusMessage = "Permissão USB negada. Toque em Conectar de novo e aceite a permissão desta vez."
+                }
+            }
+        } else {
+            openMidiDevice(device, label)
+        }
+    }
+
+    private fun openMidiDevice(device: MidiDeviceInfo, label: String) {
         statusMessage = "Conectando a $label..."
         midiHelper.connect(
             device,
